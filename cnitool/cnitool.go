@@ -23,7 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containernetworking/cni/libcni"
+	//"github.com/containernetworking/cni/libcni"
+	"github.com/mccv1r0/cni/libcni"
 )
 
 const (
@@ -104,6 +105,22 @@ func main() {
 	containerID := fmt.Sprintf("cnitool-%x", s[:10])
 
 	cninet := libcni.NewCNIConfig(filepath.SplitList(os.Getenv(EnvCNIPath)), nil)
+	cninet.ClientgRPC = true
+var f *os.File
+var ss string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+ss = fmt.Sprintf("mcc: cnitool: gRPC is %v Conn is %v\n", cninet.ClientgRPC, cninet.Conn)
+_, _ = f.Write([]byte(ss))
+	if cninet.ClientgRPC {
+	   conn, err := libcni.CNIgRPCunix()
+	   if err != nil {
+		exit(err)
+	   }
+	   cninet.Conn = conn
+	}
+ss = fmt.Sprintf("mcc: cnitool Conn is now %v \n", cninet.Conn)
+_, _ = f.Write([]byte(ss))
 
 	rt := &libcni.RuntimeConf{
 		ContainerID:    containerID,
