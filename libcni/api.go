@@ -22,11 +22,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"log"
+	"bytes"
+	"net"
+	"syscall"
+
+	//"github.com/mccv1r0/cni/cnigrpc"
+	//proto "github.com/golang/protobuf/proto"
+	"google.golang.org/grpc"
 
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/utils"
 	"github.com/containernetworking/cni/pkg/version"
+)
+
+const (
+	unixSocketPath = "/tmp/grpc.sock"
 )
 
 var (
@@ -91,6 +103,8 @@ type CNIConfig struct {
 	Path     []string
 	exec     invoke.Exec
 	cacheDir string
+	ClientgRPC bool
+	Conn *grpc.ClientConn
 }
 
 // CNIConfig implements the CNI interface
@@ -112,7 +126,21 @@ func NewCNIConfigWithCacheDir(path []string, cacheDir string, exec invoke.Exec) 
 		Path:     path,
 		cacheDir: cacheDir,
 		exec:     exec,
+		ClientgRPC: false,
 	}
+}
+
+func stringFromArgs(pairs [][2]string) (string, error) {
+	var b bytes.Buffer
+
+	for _, pair := range pairs {
+		b.WriteString(pair[0])
+		b.WriteString("=")
+		b.WriteString(pair[1])
+		b.WriteString(";")
+	}
+
+	return b.String(), nil
 }
 
 func buildOneConfig(name, cniVersion string, orig *NetworkConfig, prevResult types.Result, rt *RuntimeConf) (*NetworkConfig, error) {
@@ -398,6 +426,18 @@ func (c *CNIConfig) GetNetworkCachedConfig(net *NetworkConfig, rt *RuntimeConf) 
 }
 
 func (c *CNIConfig) addNetwork(ctx context.Context, name, cniVersion string, net *NetworkConfig, prevResult types.Result, rt *RuntimeConf) (types.Result, error) {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+
+if c.ClientgRPC {
+   s = fmt.Sprintf("mcc: addNetwork Called as CLIENT: name %v\n", name)
+   _, _ = f.Write([]byte(s))
+} else {
+   s = fmt.Sprintf("mcc: addNetwork Called as SERVER: name %v\n", name)
+   _, _ = f.Write([]byte(s))
+}
 	c.ensureExec()
 	pluginPath, err := c.exec.FindInPath(net.Network.Type, c.Path)
 	if err != nil {
@@ -418,14 +458,62 @@ func (c *CNIConfig) addNetwork(ctx context.Context, name, cniVersion string, net
 		return nil, err
 	}
 
-	return invoke.ExecPluginWithResult(ctx, pluginPath, newConf.Bytes, c.args("ADD", rt), c.exec)
+	capabilityArgs := CNIcapArgs{}
+	if rt.CapabilityArgs != nil {
+	   data, err := json.Marshal(rt.CapabilityArgs)
+	   capabilityArgsValue := string(data)
+	   if len(capabilityArgsValue) > 0 {
+		//println("capabilityArgsValue: ", capabilityArgsValue)
+		s = fmt.Sprintf("mcc: capabilityArgsValue: %v of type %T \n", capabilityArgsValue, capabilityArgsValue)
+		_, _ = f.Write([]byte(s))
+		if err = json.Unmarshal([]byte(capabilityArgsValue), &capabilityArgs); err != nil {
+			return nil, err
+		}
+		s = fmt.Sprintf("mcc: capabilityArgs: %v of type %T \n", capabilityArgs, capabilityArgs)
+		_, _ = f.Write([]byte(s))
+	   }
+	}
+
+	var cniArgs string
+	if len(rt.Args) > 0 {
+		cniArgs, _ = stringFromArgs(rt.Args)
+		s = fmt.Sprintf("mcc: cniArgs: %v of type %T \n", cniArgs, cniArgs)
+		_, _ = f.Write([]byte(s))
+	}
+
+	if !c.ClientgRPC {
+	   return invoke.ExecPluginWithResult(ctx, pluginPath, newConf.Bytes, c.args("ADD", rt), c.exec)
+	} else {
+	   //err, resultString := gRPCsendAdd(ctx, c.Conn, string(newConf.Bytes), rt.NetNS, rt.IfName, rt.Args, rt.CapabilityArgs)
+	   err, resultString := gRPCsendAdd(ctx, c.Conn, string(newConf.Bytes), rt.NetNS, rt.IfName, cniArgs, capabilityArgs)
+	   if err != nil {
+		return nil, err
+	   }
+
+	   // Plugin must return result in same version as specified in netconf
+	   versionDecoder := &version.ConfigDecoder{}
+	   confVersion, err := versionDecoder.Decode(newConf.Bytes)
+	   if err != nil {
+		return nil, err
+	   }
+
+	   return version.NewResult(confVersion, []byte(resultString))
+	}
+	return nil, err
 }
 
 // AddNetworkList executes a sequence of plugins with the ADD command
 func (c *CNIConfig) AddNetworkList(ctx context.Context, list *NetworkConfigList, rt *RuntimeConf) (types.Result, error) {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
 	var err error
 	var result types.Result
+
 	for _, net := range list.Plugins {
+s = fmt.Sprintf("  mcc: AddNetworkLIST net.Network.Type (plugin name) %v\n", net.Network.Type)
+_, _ = f.Write([]byte(s))
 		result, err = c.addNetwork(ctx, list.Name, list.CNIVersion, net, result, rt)
 		if err != nil {
 			return nil, err
@@ -440,6 +528,18 @@ func (c *CNIConfig) AddNetworkList(ctx context.Context, list *NetworkConfigList,
 }
 
 func (c *CNIConfig) checkNetwork(ctx context.Context, name, cniVersion string, net *NetworkConfig, prevResult types.Result, rt *RuntimeConf) error {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+
+if c.ClientgRPC {
+   s = fmt.Sprintf("mcc: checkNetwork Called as CLIENT:\n")
+   _, _ = f.Write([]byte(s))
+} else {
+   s = fmt.Sprintf("mcc: checkNetwork Called as SERVER:\n")
+   _, _ = f.Write([]byte(s))
+}
 	c.ensureExec()
 	pluginPath, err := c.exec.FindInPath(net.Network.Type, c.Path)
 	if err != nil {
@@ -451,7 +551,42 @@ func (c *CNIConfig) checkNetwork(ctx context.Context, name, cniVersion string, n
 		return err
 	}
 
-	return invoke.ExecPluginWithoutResult(ctx, pluginPath, newConf.Bytes, c.args("CHECK", rt), c.exec)
+	capabilityArgs := CNIcapArgs{}
+	if rt.CapabilityArgs != nil {
+	   data, err := json.Marshal(rt.CapabilityArgs)
+	   capabilityArgsValue := string(data)
+	   if len(capabilityArgsValue) > 0 {
+		//println("capabilityArgsValue: ", capabilityArgsValue)
+		s = fmt.Sprintf("mcc: capabilityArgsValue: %v of type %T \n", capabilityArgsValue, capabilityArgsValue)
+		_, _ = f.Write([]byte(s))
+		if err = json.Unmarshal([]byte(capabilityArgsValue), &capabilityArgs); err != nil {
+			return err
+		}
+		s = fmt.Sprintf("mcc: capabilityArgs: %v of type %T \n", capabilityArgs, capabilityArgs)
+		_, _ = f.Write([]byte(s))
+	   }
+	}
+
+	var cniArgs string
+	if len(rt.Args) > 0 {
+		cniArgs, _ = stringFromArgs(rt.Args)
+		s = fmt.Sprintf("mcc: cniArgs: %v of type %T \n", cniArgs, cniArgs)
+		_, _ = f.Write([]byte(s))
+	}
+
+	if !c.ClientgRPC {
+	   return invoke.ExecPluginWithoutResult(ctx, pluginPath, newConf.Bytes, c.args("CHECK", rt), c.exec)
+	} else {
+	   err := gRPCsendCheck(ctx, c.Conn, string(newConf.Bytes), rt.NetNS, rt.IfName, cniArgs, capabilityArgs)
+	   //err := gRPCsendCheck(ctx, c.Conn, string(net.Bytes), rt.NetNS, rt.IfName, cniArgs, capabilityArgs)
+	   if err != nil {
+		return err
+	   }
+
+	   return nil
+	}
+
+	return nil	
 }
 
 // CheckNetworkList executes a sequence of plugins with the CHECK command
@@ -482,6 +617,18 @@ func (c *CNIConfig) CheckNetworkList(ctx context.Context, list *NetworkConfigLis
 }
 
 func (c *CNIConfig) delNetwork(ctx context.Context, name, cniVersion string, net *NetworkConfig, prevResult types.Result, rt *RuntimeConf) error {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+
+if c.ClientgRPC {
+   s = fmt.Sprintf("mcc: delNetwork Called as CLIENT:\n")
+   _, _ = f.Write([]byte(s))
+} else {
+   s = fmt.Sprintf("mcc: delNetwork Called as SERVER:\n")
+   _, _ = f.Write([]byte(s))
+}
 	c.ensureExec()
 	pluginPath, err := c.exec.FindInPath(net.Network.Type, c.Path)
 	if err != nil {
@@ -493,11 +640,47 @@ func (c *CNIConfig) delNetwork(ctx context.Context, name, cniVersion string, net
 		return err
 	}
 
-	return invoke.ExecPluginWithoutResult(ctx, pluginPath, newConf.Bytes, c.args("DEL", rt), c.exec)
+	capabilityArgs := CNIcapArgs{}
+	if rt.CapabilityArgs != nil {
+	   data, err := json.Marshal(rt.CapabilityArgs)
+	   capabilityArgsValue := string(data)
+	   if len(capabilityArgsValue) > 0 {
+		//println("capabilityArgsValue: ", capabilityArgsValue)
+		s = fmt.Sprintf("mcc: capabilityArgsValue: %v of type %T \n", capabilityArgsValue, capabilityArgsValue)
+		_, _ = f.Write([]byte(s))
+		if err = json.Unmarshal([]byte(capabilityArgsValue), &capabilityArgs); err != nil {
+			return err
+		}
+		s = fmt.Sprintf("mcc: capabilityArgs: %v of type %T \n", capabilityArgs, capabilityArgs)
+		_, _ = f.Write([]byte(s))
+	   }
+	}
+
+	var cniArgs string
+	if len(rt.Args) > 0 {
+		cniArgs, _ = stringFromArgs(rt.Args)
+		s = fmt.Sprintf("mcc: cniArgs: %v of type %T \n", cniArgs, cniArgs)
+		_, _ = f.Write([]byte(s))
+	}
+
+	if !c.ClientgRPC {
+	   return invoke.ExecPluginWithoutResult(ctx, pluginPath, newConf.Bytes, c.args("DEL", rt), c.exec)
+	} else {
+	   err := gRPCsendDel(ctx, c.Conn, string(newConf.Bytes), rt.NetNS, rt.IfName, cniArgs, capabilityArgs)
+	   //err := gRPCsendDel(ctx, c.Conn, string(net.Bytes), rt.NetNS, rt.IfName, cniArgs, capabilityArgs)
+	   if err != nil {
+		return err
+	   }
+
+	   return nil
+	}
+
+	return nil
 }
 
 // DelNetworkList executes a sequence of plugins with the DEL command
 func (c *CNIConfig) DelNetworkList(ctx context.Context, list *NetworkConfigList, rt *RuntimeConf) error {
+
 	var cachedResult types.Result
 
 	// Cached result on DEL was added in CNI spec version 0.4.0 and higher
@@ -523,6 +706,16 @@ func (c *CNIConfig) DelNetworkList(ctx context.Context, list *NetworkConfigList,
 
 // AddNetwork executes the plugin with the ADD command
 func (c *CNIConfig) AddNetwork(ctx context.Context, net *NetworkConfig, rt *RuntimeConf) (types.Result, error) {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+s = fmt.Sprintf("mcc: AddNetwork Called net.Network.Name %v \n", net.Network.Name)
+_, _ = f.Write([]byte(s))
+s = fmt.Sprintf("mcc: AddNetwork Called net %v \n", string(net.Bytes))
+_, _ = f.Write([]byte(s))
+s = fmt.Sprintf("mcc: AddNetwork Called rt %v \n", rt)
+_, _ = f.Write([]byte(s))
 	result, err := c.addNetwork(ctx, net.Network.Name, net.Network.CNIVersion, net, nil, rt)
 	if err != nil {
 		return nil, err
@@ -553,6 +746,7 @@ func (c *CNIConfig) CheckNetwork(ctx context.Context, net *NetworkConfig, rt *Ru
 
 // DelNetwork executes the plugin with the DEL command
 func (c *CNIConfig) DelNetwork(ctx context.Context, net *NetworkConfig, rt *RuntimeConf) error {
+
 	var cachedResult types.Result
 
 	// Cached result on DEL was added in CNI spec version 0.4.0 and higher
@@ -660,7 +854,6 @@ func (c *CNIConfig) GetVersionInfo(ctx context.Context, pluginType string) (vers
 	return invoke.GetVersionInfo(ctx, pluginPath, c.exec)
 }
 
-// =====
 func (c *CNIConfig) args(action string, rt *RuntimeConf) *invoke.Args {
 	return &invoke.Args{
 		Command:     action,
@@ -670,4 +863,240 @@ func (c *CNIConfig) args(action string, rt *RuntimeConf) *invoke.Args {
 		IfName:      rt.IfName,
 		Path:        strings.Join(c.Path, string(os.PathListSeparator)),
 	}
+}
+
+// Authentication holds the login/password
+type Authentication struct {
+	Login    string
+	Password string
+}
+
+// GetRequestMetadata gets the current request metadata
+func (a *Authentication) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{
+		"login":    a.Login,
+		"password": a.Password,
+	}, nil
+}
+
+// RequireTransportSecurity indicates whether the credentials requires transport security
+func (a *Authentication) RequireTransportSecurity() bool {
+	return true
+}
+
+func CNIgRPCtcp() (*grpc.ClientConn, error) {
+	var conn *grpc.ClientConn
+
+	// Initiate a connection with the server
+	//conn, err = grpc.Dial("localhost:7777", grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(&auth))
+	conn, err := grpc.Dial("localhost:7777", grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("did not connect: %s", err)
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func CNIgRPCunix() (*grpc.ClientConn, error) {
+
+	var conn *grpc.ClientConn
+
+	// Initiate a connection with the server
+	//conn, err = grpc.Dial("unix:///tmp/grpc.sock", grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(&auth))
+	conn, err := grpc.Dial("unix:///tmp/grpc.sock", grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("did not connect: %s", err)
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func gRPCsendAdd(ctx context.Context, conn *grpc.ClientConn, conf string, netns string, ifName string, args string, capArgs CNIcapArgs) (error, string) {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+s = fmt.Sprintf("mcc: gRPCsendAdd Called\n")
+_, _ = f.Write([]byte(s))
+f.Sync()
+
+	cni := NewCNIserverClient(conn)
+
+	cniAddMsg := CNIaddMsg{
+		Conf:    conf,
+		NetNS:   netns,
+		IfName:  ifName,
+		CniArgs: args,
+		CapArgs: &capArgs,
+	}
+
+	s = fmt.Sprintf("mcc: Send message Conf file: %s \n", cniAddMsg.Conf)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message ContainerID: %s \n", cniAddMsg.ContainerID)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message NetNS: %s \n", cniAddMsg.NetNS)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message IfName: %s \n", cniAddMsg.IfName)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniArgs: %s \n", cniAddMsg.CniArgs)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniCapArgs: %s \n", cniAddMsg.CapArgs)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	resultAdd, err := cni.CNIadd(ctx, &cniAddMsg)
+	if err != nil {
+		log.Fatalf("error when calling CNIadd: %s", err)
+		return err, ""
+	}
+	s = fmt.Sprintf("mcc: Response from TCP server: %s (string)\n", resultAdd.StdOut)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	return nil, resultAdd.StdOut
+}
+
+func gRPCsendCheck(ctx context.Context, conn *grpc.ClientConn, conf string, netns string, ifName string, args string, capArgs CNIcapArgs) error {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+s = fmt.Sprintf("mcc: gRPCsendCheck Called\n")
+_, _ = f.Write([]byte(s))
+f.Sync()
+
+	cni := NewCNIserverClient(conn)
+
+	cniCheckMsg := CNIcheckMsg{
+		Conf:    conf,
+		NetNS:   netns,
+		IfName:  ifName,
+		CniArgs: args,
+		CapArgs: &capArgs,
+	}
+
+	s = fmt.Sprintf("mcc: Send message Conf file: %s \n", cniCheckMsg.Conf)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message ContainerID: %s \n", cniCheckMsg.ContainerID)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message NetNS: %s \n", cniCheckMsg.NetNS)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message IfName: %s \n", cniCheckMsg.IfName)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniArgs: %s \n", cniCheckMsg.CniArgs)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniCapArgs: %s \n", cniCheckMsg.CapArgs)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	resultCheck, err := cni.CNIcheck(ctx, &cniCheckMsg)
+	if err != nil {
+		log.Fatalf("error when calling CNIcheck: %s", err)
+		return err
+	}
+	s = fmt.Sprintf("mcc: Response from TCP server: %s (string)\n", resultCheck.Error)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	return nil
+}
+
+func gRPCsendDel(ctx context.Context, conn *grpc.ClientConn, conf string, netns string, ifName string, args string, capArgs CNIcapArgs) error {
+var f *os.File
+var s string
+f, _ = os.OpenFile("/tmp/check.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+defer f.Close()
+s = fmt.Sprintf("mcc: gRPCsendDel Called\n")
+_, _ = f.Write([]byte(s))
+f.Sync()
+
+	cni := NewCNIserverClient(conn)
+
+	cniMsg := CNIdelMsg{
+		Conf:    conf,
+		NetNS:   netns,
+		IfName:  ifName,
+		CniArgs: args,
+		CapArgs: &capArgs,
+	}
+
+	s = fmt.Sprintf("mcc: Send message Conf file: %s \n", cniMsg.Conf)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message ContainerID: %s \n", cniMsg.ContainerID)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message NetNS: %s \n", cniMsg.NetNS)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message IfName: %s \n", cniMsg.IfName)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniArgs: %s \n", cniMsg.CniArgs)
+	_, _ = f.Write([]byte(s))
+	s = fmt.Sprintf("mcc:      message CniCapArgs: %s \n", cniMsg.CapArgs)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	resultDel, err := cni.CNIdel(ctx, &cniMsg)
+	if err != nil {
+		log.Fatalf("error when calling CNIdel: %s", err)
+		return err
+	}
+	s = fmt.Sprintf("mcc: Response from TCP server: %s (string)\n", resultDel.Error)
+	_, _ = f.Write([]byte(s))
+	f.Sync()
+
+	return nil
+}
+
+func StartGRPCunixServer(address string) error {
+	// create a listener on unix socket
+	syscall.Unlink(unixSocketPath)
+	lis, err := net.Listen("unix", unixSocketPath)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %v", err)
+	}
+
+	// create a CNI server instance
+	cni := CNIServer{}
+
+	// create a gRPC server object
+	//grpcCNIServer := grpc.NewServer(opts...)
+	grpcCNIServer := grpc.NewServer()
+
+	// attach the CNI service to the server
+	RegisterCNIserverServer(grpcCNIServer, &cni)
+
+	// start the server
+	log.Printf("starting CNI unix socket gRPC server on %s", unixSocketPath)
+	if err := grpcCNIServer.Serve(lis); err != nil {
+		return fmt.Errorf("failed to serve: %s", err)
+	}
+
+	return nil
+}
+
+func StartGRPCtcpServer(address string) error {
+	// create a listener on TCP port
+	lis, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %v", err)
+	}
+
+	// create a CNI server instance
+	cni := CNIServer{}
+
+	// create a gRPC server object
+	//grpcCNIServer := grpc.NewServer(opts...)
+	grpcCNIServer := grpc.NewServer()
+
+	// attach the CNI service to the server
+	RegisterCNIserverServer(grpcCNIServer, &cni)
+
+	// start the server
+	log.Printf("starting CNI HTTP/2 gRPC server on %s", address)
+	if err := grpcCNIServer.Serve(lis); err != nil {
+		return fmt.Errorf("failed to serve: %s", err)
+	}
+
+	return nil
 }
