@@ -13,15 +13,14 @@
 // limitations under the License.
 
 syntax = "proto3";
-//package cnigrpc;
 package libcni;
 
-import "google/api/annotations.proto";
+//import "google/api/annotations.proto";
 
 service CNIserver {
   // Process CNI message
   rpc CNIconfig (ConfPath) returns (CNIerror) {}
-  
+
   rpc CNIadd (CNIaddMsg) returns (ADDresult) {
   }
 

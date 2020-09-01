@@ -586,7 +586,7 @@ if c.ClientgRPC {
 	   return nil
 	}
 
-	return nil	
+	return nil
 }
 
 // CheckNetworkList executes a sequence of plugins with the CHECK command

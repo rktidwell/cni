@@ -20,8 +20,8 @@ import (
 	//"net"
 	//"syscall"
 
-	//"github.com/containernetworking/cni/libcni"
-	"github.com/mccv1r0/cni/libcni"
+	"github.com/containernetworking/cni/libcni"
+	//"github.com/mccv1r0/cni/libcni"
 	//"github.com/mccv1r0/cni/cnigrpc"
 	//"google.golang.org/grpc"
 )

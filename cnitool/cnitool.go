@@ -23,8 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	//"github.com/containernetworking/cni/libcni"
-	"github.com/mccv1r0/cni/libcni"
+	"github.com/containernetworking/cni/libcni"
+	//"github.com/mccv1r0/cni/libcni"
 )
 
 const (
